@@ -1,0 +1,504 @@
+name: Zbuduj BraciaRanks JAR
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Zainstaluj Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+          cache-dependency-path: plugin/pom.xml
+
+      - name: Zbuduj plik .jar
+        run: mvn -B clean package
+
+      - name: Udostepnij gotowy .jar do pobrania
+        uses: actions/upload-artifact@v4
+        with:
+          name: BraciaRanks-JAR
+          path: plugin/target/*.jar
+
+package pl.bracia.ranks;
+
+import me.clip.placeholderapi.expansion.PlaceholderExpansion;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.entity.Player;
+import org.jetbrains.annotations.NotNull;
+
+public class BraciaPlaceholderExpansion extends PlaceholderExpansion {
+
+    private final BraciaRanksPlugin plugin;
+
+    public BraciaPlaceholderExpansion(BraciaRanksPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    @Override
+    public @NotNull String getIdentifier() {
+        return "braciaranks";
+    }
+
+    @Override
+    public @NotNull String getAuthor() {
+        return "Bracia";
+    }
+
+    @Override
+    public @NotNull String getVersion() {
+        return "4.0.0";
+    }
+
+    @Override
+    public boolean persist() {
+        return true;
+    }
+
+    @Override
+    public String onRequest(OfflinePlayer offlinePlayer, @NotNull String params) {
+        if (offlinePlayer == null || !offlinePlayer.isOnline()) return "";
+        Player player = offlinePlayer.getPlayer();
+        if (player == null) return "";
+
+        BraciaRanksPlugin.RankData rank = plugin.getPlayerRank(player);
+        return switch (params.toLowerCase()) {
+            case "prefix" -> rank.prefix();
+            case "rank", "name" -> rank.id();
+            case "color" -> rank.color();
+            case "weight" -> String.valueOf(rank.weight());
+            default -> null;
+        };
+    }
+}
+
+package pl.bracia.ranks;
+
+import io.papermc.paper.event.player.AsyncChatEvent;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import net.luckperms.api.LuckPerms;
+import net.luckperms.api.event.user.UserDataRecalculateEvent;
+import net.luckperms.api.node.NodeType;
+import net.luckperms.api.node.types.InheritanceNode;
+import net.luckperms.api.model.user.User;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.plugin.RegisteredServiceProvider;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scoreboard.Scoreboard;
+import org.bukkit.scoreboard.Team;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public final class BraciaRanksPlugin extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
+
+    private final Map<String, RankData> ranks = new LinkedHashMap<>();
+    private LuckPerms luckPerms;
+    private final LegacyComponentSerializer legacy = LegacyComponentSerializer.legacyAmpersand();
+
+    public record RankData(String id, String prefix, String color, int weight) {}
+
+    @Override
+    public void onEnable() {
+        saveDefaultConfig();
+        loadRanks();
+
+        if (Bukkit.getPluginManager().isPluginEnabled("LuckPerms")) {
+            RegisteredServiceProvider<LuckPerms> provider = Bukkit.getServicesManager().getRegistration(LuckPerms.class);
+            if (provider != null) {
+                luckPerms = provider.getProvider();
+                luckPerms.getEventBus().subscribe(this, UserDataRecalculateEvent.class, e -> {
+                    java.util.UUID uuid = e.getUser().getUniqueId();
+                    Bukkit.getScheduler().runTask(this, () -> {
+                        Player p = Bukkit.getPlayer(uuid);
+                        if (p != null) applyVisuals(p);
+                    });
+                });
+            }
+        }
+
+        if (Bukkit.getPluginManager().isPluginEnabled("PlaceholderAPI")) {
+            new BraciaPlaceholderExpansion(this).register();
+        }
+
+        Bukkit.getPluginManager().registerEvents(this, this);
+        if (getCommand("braciaranks") != null) {
+            getCommand("braciaranks").setExecutor(this);
+            getCommand("braciaranks").setTabCompleter(this);
+        }
+
+        Bukkit.getOnlinePlayers().forEach(this::applyVisuals);
+    }
+
+    public void loadRanks() {
+        reloadConfig();
+        ranks.clear();
+        ConfigurationSection section = getConfig().getConfigurationSection("ranks");
+        if (section == null) return;
+
+        section.getKeys(false).stream()
+                .map(key -> new RankData(
+                        key.toLowerCase(),
+                        section.getString(key + ".prefix", ""),
+                        section.getString(key + ".color", "&f"),
+                        section.getInt(key + ".weight", 0)
+                ))
+                .sorted(Comparator.comparingInt(RankData::weight).reversed())
+                .forEach(r -> ranks.put(r.id(), r));
+    }
+
+    public RankData getPlayerRank(Player player) {
+        if (luckPerms != null) {
+            User user = luckPerms.getUserManager().getUser(player.getUniqueId());
+            if (user != null) {
+                String primary = user.getPrimaryGroup().toLowerCase();
+                if (ranks.containsKey(primary)) {
+                    return ranks.get(primary);
+                }
+                for (RankData rank : ranks.values()) {
+                    if (player.hasPermission("group." + rank.id())) {
+                        return rank;
+                    }
+                }
+            }
+        }
+
+        for (RankData rank : ranks.values()) {
+            if (player.hasPermission("braciaranks.group." + rank.id())) {
+                return rank;
+            }
+        }
+
+        String def = getConfig().getString("default-rank", "gracz").toLowerCase();
+        return ranks.getOrDefault(def, new RankData("default", "", "&7", 0));
+    }
+
+    public void applyVisuals(Player player) {
+        if (!getConfig().getBoolean("tab.manage-tab-and-nametag", true)) return;
+
+        RankData rank = getPlayerRank(player);
+        boolean bold = getConfig().getBoolean("tab.bold-nick", true);
+        String nickStyle = rank.color() + (bold ? "&l" : "");
+
+        player.playerListName(legacy.deserialize(rank.prefix() + " " + nickStyle + player.getName()));
+
+        Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
+        String teamName = String.format("%03d_%s", 999 - Math.min(rank.weight(), 999), rank.id());
+        if (teamName.length() > 16) teamName = teamName.substring(0, 16);
+
+        for (Team t : board.getTeams()) {
+            if (t.hasEntry(player.getName()) && !t.getName().equals(teamName)) {
+                t.removeEntry(player.getName());
+            }
+        }
+
+        Team team = board.getTeam(teamName);
+        if (team == null) {
+            team = board.registerNewTeam(teamName);
+        }
+        team.prefix(legacy.deserialize(rank.prefix() + " " + nickStyle));
+        team.addEntry(player.getName());
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        applyVisuals(player);
+
+        String url = getConfig().getString("resource-pack.url", "");
+        if (url != null && !url.isBlank()) {
+            String sha1 = getConfig().getString("resource-pack.sha1", "");
+            boolean required = getConfig().getBoolean("resource-pack.required", true);
+            Component prompt = legacy.deserialize(getConfig().getString("resource-pack.prompt", ""));
+            player.setResourcePack(url, sha1, required, prompt);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onChat(AsyncChatEvent event) {
+        if (!getConfig().getBoolean("chat.format-chat", true)) return;
+
+        Player player = event.getPlayer();
+        RankData rank = getPlayerRank(player);
+        String rawFormat = getConfig().getString("chat.format", "%prefix% %color%&l%player%&8: &f%message%");
+
+        event.renderer((source, sourceDisplayName, message, viewer) -> {
+            String header = rawFormat
+                    .replace("%prefix%", rank.prefix())
+                    .replace("%color%", rank.color())
+                    .replace("%player%", source.getName())
+                    .replace("%message%", "");
+            return legacy.deserialize(header).append(message);
+        });
+    }
+
+    @Override
+    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label, @NotNull String[] args) {
+        if (args.length == 0) {
+            sender.sendMessage(ChatColor.GOLD + "BraciaRanks v" + getPluginMeta().getVersion() + ChatColor.GRAY
+                    + " - /braciaranks <reload|list|set <gracz> <ranga>>");
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("reload")) {
+            loadRanks();
+            Bukkit.getOnlinePlayers().forEach(this::applyVisuals);
+            sender.sendMessage(ChatColor.GREEN + "Przeladowano BraciaRanks!");
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("list")) {
+            for (RankData r : ranks.values()) {
+                sender.sendMessage(ChatColor.GRAY + "- " + r.id() + ": " + ChatColor.RESET + r.prefix() + " "
+                        + ChatColor.translateAlternateColorCodes('&', r.color() + "&lPrzykladowyNick"));
+            }
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("set")) {
+            if (args.length < 3) {
+                sender.sendMessage(ChatColor.RED + "Uzycie: /" + label + " set <gracz> <ranga>");
+                return true;
+            }
+            if (luckPerms == null) {
+                sender.sendMessage(ChatColor.RED + "Komenda set wymaga pluginu LuckPerms.");
+                return true;
+            }
+            String rankId = args[2].toLowerCase();
+            if (!ranks.containsKey(rankId)) {
+                sender.sendMessage(ChatColor.RED + "Nie ma takiej rangi. Dostepne: " + String.join(", ", ranks.keySet()));
+                return true;
+            }
+            OfflinePlayer target = Bukkit.getOfflinePlayerIfCached(args[1]);
+            if (target == null) {
+                sender.sendMessage(ChatColor.RED + "Nie znam gracza " + args[1] + " (musi byc kiedys na serwerze).");
+                return true;
+            }
+            java.util.UUID uuid = target.getUniqueId();
+            luckPerms.getGroupManager().createAndLoadGroup(rankId)
+                    .thenCompose(group -> luckPerms.getUserManager().modifyUser(uuid, user -> {
+                        user.data().clear(NodeType.INHERITANCE::matches);
+                        user.data().add(InheritanceNode.builder(group).build());
+                        user.setPrimaryGroup(group.getName());
+                    }))
+                    .whenComplete((v, err) -> Bukkit.getScheduler().runTask(this, () -> {
+                        if (err != null) {
+                            sender.sendMessage(ChatColor.RED + "Blad LuckPerms: " + err.getMessage());
+                            return;
+                        }
+                        Player online = Bukkit.getPlayer(uuid);
+                        if (online != null) applyVisuals(online);
+                        sender.sendMessage(ChatColor.GREEN + "Ustawiono range " + rankId + " dla " + args[1] + ".");
+                    }));
+            return true;
+        }
+
+        sender.sendMessage(ChatColor.RED + "Nieznana podkomenda. Uzyj: /" + label + " <reload|list|set>");
+        return true;
+    }
+
+    @Override
+    public List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command, @NotNull String alias, @NotNull String[] args) {
+        List<String> out = new ArrayList<>();
+        if (args.length == 1) {
+            for (String sub : List.of("reload", "list", "set")) {
+                if (sub.startsWith(args[0].toLowerCase())) out.add(sub);
+            }
+        } else if (args.length == 2 && args[0].equalsIgnoreCase("set")) {
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                if (p.getName().toLowerCase().startsWith(args[1].toLowerCase())) out.add(p.getName());
+            }
+        } else if (args.length == 3 && args[0].equalsIgnoreCase("set")) {
+            for (String id : ranks.keySet()) {
+                if (id.startsWith(args[2].toLowerCase())) out.add(id);
+            }
+        }
+        return out;
+    }
+}
+
+name: BraciaRanks
+version: 4.0.0
+main: pl.bracia.ranks.BraciaRanksPlugin
+api-version: '1.21'
+authors: [Bracia]
+description: Samodzielny plugin rang z grafikami bitmapowymi (bez ItemsAdder)
+softdepend: [LuckPerms, PlaceholderAPI]
+
+commands:
+  braciaranks:
+    description: Zarzadzanie rangami i konfiguracja BraciaRanks
+    usage: /braciaranks <reload|list|set>
+    permission: braciaranks.admin
+    aliases: [branks, rangi]
+
+permissions:
+  braciaranks.admin:
+    description: Pozwala na zarzadzanie pluginem BraciaRanks
+    default: op
+
+resource-pack:
+  url: ""
+  sha1: "57aa6ef512c804674400dc95cbbf6cffb1539e91"
+  required: true
+  prompt: "&6&lBRACIA &8» &7Zaakceptuj paczke zasobow, aby widziec ikony rang!"
+
+chat:
+  format-chat: true
+  format: "%prefix% %color%&l%player%&8: &f%message%"
+
+tab:
+  manage-tab-and-nametag: true
+  bold-nick: true
+
+ranks:
+  ceo:
+    prefix: "\uE001"
+    color: "&c"
+    weight: 100
+  admin:
+    prefix: "\uE002"
+    color: "&6"
+    weight: 90
+  mod:
+    prefix: "\uE003"
+    color: "&3"
+    weight: 80
+  helper:
+    prefix: "\uE004"
+    color: "&a"
+    weight: 70
+  media:
+    prefix: "\uE005"
+    color: "&d"
+    weight: 60
+  gracz:
+    prefix: "\uE006"
+    color: "&7"
+    weight: 50
+  svip:
+    prefix: "\uE007"
+    color: "&b"
+    weight: 40
+
+default-rank: "gracz"
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>pl.bracia</groupId>
+    <artifactId>BraciaRanks</artifactId>
+    <version>4.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <java.version>21</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>papermc</id>
+            <url>https://repo.papermc.io/repository/maven-public/</url>
+        </repository>
+        <repository>
+            <id>placeholderapi</id>
+            <url>https://repo.extendedclip.com/content/repositories/placeholderapi/</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.papermc.paper</groupId>
+            <artifactId>paper-api</artifactId>
+            <version>1.21.4-R0.1-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>net.luckperms</groupId>
+            <artifactId>api</artifactId>
+            <version>5.4</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>me.clip</groupId>
+            <artifactId>placeholderapi</artifactId>
+            <version>2.11.6</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+=== BRACIARANKS v4.0 - INSTRUKCJA ===
+
+Co nowego w v4.0:
+- NAPRAWIONO: ikony rang wyswietlaly sie jako puste kwadraty (font byl w zlej
+  przestrzeni nazw). Teraz dzialaja w czacie, TAB-ie i nad glowa.
+- /braciaranks set <gracz> <ranga>  - dziala (wymaga LuckPerms)
+- Autouzupelnianie komend (TAB)
+- Zmiana rangi w LuckPerms odswieza TAB/nametag od razu, bez relogu
+- Nowy placeholder %braciaranks_weight%
+- Zsynchronizowane wersje (pom / plugin.yml / placeholder)
+
+WYMAGANIA: Paper 1.21+ i Java 21. LuckPerms i PlaceholderAPI opcjonalne.
+
+BUDOWANIE JAR (w tym srodowisku nie ma kompilatora, wiec robi to GitHub Actions):
+1. Wrzuc zawartosc tej paczki do repozytorium na GitHubie.
+2. Actions -> "Zbuduj BraciaRanks JAR" -> Run workflow.
+3. Pobierz artefakt "BraciaRanks-JAR" i wrzuc .jar do plugins/.
+
+RESOURCE PACK:
+4. Wrzuc "BraciaRanks-ResourcePack-v4.zip" na mc-packs.net (lub inny hosting z
+   bezposrednim linkiem), wklej link do plugins/BraciaRanks/config.yml
+   (resource-pack.url). SHA1 jest juz wpisany w configu:
+   57aa6ef512c804674400dc95cbbf6cffb1539e91
+5. /braciaranks reload
+
+RANGI W LUCKPERMS: nazwy grup musza sie zgadzac z config.yml
+(ceo, admin, mod, helper, media, gracz, svip).
+Uwaga: ranga "media" uzywa grafiki tworca.png.
